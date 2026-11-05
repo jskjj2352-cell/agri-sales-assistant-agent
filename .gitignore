@@ -1,0 +1,8 @@
+api_key.txt
+qwen_key.txt
+settings.txt
+run_log.txt
+data/store.db
+data/*.bak
+orders/
+__pycache__/
