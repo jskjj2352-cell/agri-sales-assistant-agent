@@ -51,7 +51,7 @@ print("✓ 底价不会泄露给模型")
 
 r = tools.calc_dosage("P003", "马铃薯", "晚疫病", 20)
 assert r["建议购买数量"] == 8, r  # 40g x 20亩 = 800g / 100g = 8袋
-print("✓ 用量计算：20亩", r["建议购买"], "小计", r["小计"])
+print("✓ 用量计算：20亩", r["建议购买数量"], "小计", r["小计"])
 
 r = tools.calc_dosage("P005", "番茄", "早疫病", 5)
 assert "error" in r

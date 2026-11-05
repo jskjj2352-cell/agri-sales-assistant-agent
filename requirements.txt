@@ -1,3 +1,4 @@
 openai>=1.0
 streamlit>=1.46
 pillow
+pandas>=2.0

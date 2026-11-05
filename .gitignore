@@ -6,3 +6,8 @@ data/store.db
 data/*.bak
 orders/
 __pycache__/
+test_log.txt
+.env
+.env.*
+.venv/
+data/store.db-*

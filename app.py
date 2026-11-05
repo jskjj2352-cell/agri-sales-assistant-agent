@@ -6,7 +6,7 @@
 """
 import os
 from datetime import date
-from pathlib import Path
+from contextlib import closing
 
 import streamlit as st
 from openai import APIError
@@ -165,10 +165,10 @@ with st.sidebar:
             void = "　~~已作废~~" if o["status"] == "作废" else ""
             st.markdown(f"#{o['id']}　{o['created_at'][11:16]}　{o['customer'] or '散客'}　**{o['total']:g} 元**{void}")
     with st.expander("📦 库存"):
-        rows = conn.execute("SELECT name, price, stock, package FROM products ORDER BY stock").fetchall()
+        rows = conn.execute("SELECT name, price, stock, package, stock_warning FROM products ORDER BY stock").fetchall()
         st.dataframe(
             [{"商品": r["name"], "售价": r["price"], "库存": f"{r['stock']}{r['package']}",
-              "提醒": "⚠️ 快没了" if r["stock"] < 10 else ""} for r in rows],
+              "提醒": "缺货" if r["stock"] <= 0 else "⚠️ 库存偏低" if r["stock"] <= r["stock_warning"] else ""} for r in rows],
             hide_index=True, width="stretch")
     conn.close()
     st.caption(f"对话模型：{agent.MODEL}")
@@ -291,7 +291,10 @@ if user_text:
             reply["tools"].append(label)
             status.write(label)
             if name == "create_order" and result.get("ok"):
-                reply["guide"] = Path(result["用药说明文件"]).read_text(encoding="utf-8")
+                with closing(connect()) as guide_conn:
+                    saved = guide_conn.execute("SELECT guide FROM orders WHERE id=?", (result["订单号"],)).fetchone()
+                if saved:
+                    reply["guide"] = saved["guide"]
 
         checkpoint = len(ss.messages)
         ss.messages.append({"role": "user", "content": content})

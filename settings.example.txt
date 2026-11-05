@@ -1,0 +1,3 @@
+# 复制此文件为 settings.txt，并设置自己的后台密码。
+# settings.txt 已被 Git 忽略，请勿提交密码或 API 密钥。
+ADMIN_PASSWORD=请改成你的密码

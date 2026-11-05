@@ -6,7 +6,9 @@ from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
-from store import add_purchase, connect, export_catalog_csv, init_db, void_order
+from store import (CATEGORIES, add_purchase, connect, export_catalog_csv, init_db,
+                   inventory_alerts, void_order)
+from inventory_ui import render_inventory, render_movements, render_statistics
 
 st.set_page_config(page_title="老板后台", page_icon="🔐", layout="wide")
 init_db()
@@ -49,6 +51,7 @@ def clean(v):
 
 def done(msg):
     ss.flash = msg
+    conn.close()
     st.rerun()
 
 
@@ -56,8 +59,20 @@ def csv_bytes(df):
     return df.to_csv(index=False).encode("utf-8-sig")  # 带 BOM，Excel 直接打开不乱码
 
 
-tab_sum, tab_in, tab_prod, tab_ledger, tab_order = st.tabs(
-    ["📊 经营概况", "🚚 进货入库", "💰 商品与价格", "📒 台账导出", "🧾 订单管理"])
+alerts = inventory_alerts(conn)
+if alerts:
+    st.warning(f"有 {len(alerts)} 件商品达到库存预警线，其中 {sum(p['stock'] <= 0 for p in alerts)} 件缺货。请查看【库存预警】。")
+
+tab_sum, tab_stock, tab_in, tab_movements, tab_stats, tab_prod, tab_ledger, tab_order = st.tabs(
+    ["📊 经营概况", "⚠️ 库存预警", "🚚 进货入库", "📦 出入库流水", "📈 进出货统计",
+     "💰 商品与价格", "📒 台账导出", "🧾 订单管理"])
+
+with tab_stock:
+    render_inventory(conn, products, done)
+with tab_movements:
+    render_movements(conn, products)
+with tab_stats:
+    render_statistics(conn, products)
 
 # ---------------- 经营概况 ----------------
 with tab_sum:
@@ -78,7 +93,7 @@ with tab_sum:
     c2.metric("订单数", n_orders)
     c3.metric("毛利", f"{profit:,.2f} 元")
     if len(items) and len(known) < len(items):
-        st.caption("⚠️ 有些商品还没有进货记录（不知道进价），这部分没算进毛利。在【进货入库】登记后就能算了。")
+        st.caption("⚠️ 部分销售缺少开单时的进价，未计入毛利；事后补录进货不会改变历史订单成本。")
 
     left, right = st.columns(2)
     with left:
@@ -90,9 +105,10 @@ with tab_sum:
         else:
             st.caption("这段时间没有销售")
     with right:
-        st.subheader("⚠️ 库存不足（少于10）")
-        low = [{"商品": p["name"], "库存": f"{p['stock']}{p['package']}"}
-               for p in products if p["stock"] < 10]
+        st.subheader("⚠️ 库存预警")
+        low = [{"商品": p["name"], "库存": f"{p['stock']}{p['package']}",
+                "预警线": p["stock_warning"], "建议补货": p["suggested_qty"]}
+               for p in alerts]
         if low:
             st.dataframe(low, hide_index=True, width="stretch")
         else:
@@ -116,8 +132,12 @@ with tab_in:
             if cost <= 0:
                 st.error("请填进价，不填没法算毛利")
             else:
-                add_purchase(pid, qty, cost, supplier, batch, prod_date, note)
-                done(f"已入库：{pmap[pid]['name']} × {qty}，现有 {pmap[pid]['stock'] + qty}")
+                try:
+                    purchase_id = add_purchase(pid, qty, cost, supplier, batch, prod_date, note)
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    done(f"采购单 #{purchase_id} 已入库：{pmap[pid]['name']} × {qty}")
     st.subheader("最近进货")
     st.dataframe(pd.read_sql_query(
         """SELECT created_at 时间, name 商品, qty 数量, unit_cost 进价, supplier 供货商,
@@ -127,7 +147,7 @@ with tab_in:
 # ---------------- 商品与价格 ----------------
 with tab_prod:
     st.subheader("改价格 / 商品资料")
-    st.caption("直接在表格里改，改完点保存。库存不能在这里改，请用【进货入库】或作废订单。")
+    st.caption("直接在表格里改，改完点保存。库存请用【进货入库】、作废订单或【库存预警】中的盘点功能调整。")
     pdf = pd.read_sql_query(
         """SELECT id, category, name, price, min_price, stock, manufacturer, reg_no, toxicity,
                   restricted, notes FROM products ORDER BY id""", conn)

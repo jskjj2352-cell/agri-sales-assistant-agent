@@ -7,8 +7,9 @@
 - 农户的俗称（土豆、腻虫、钻心虫……）自动转换成标准名称再匹配。
 """
 import math
+from contextlib import closing
 
-from store import connect, now, to_json, BASE, spec_text, latest_cost
+from store import connect, now, to_json, BASE, spec_text, latest_cost, change_stock, stock_integer
 
 ORDERS_DIR = BASE / "orders"
 
@@ -269,27 +270,40 @@ def check_mix(product_ids: list):
 
 def quote(items: list):
     """items: [{product_id, qty, unit_price(可选，砍价后的单价)}]"""
-    conn = connect()
+    with closing(connect()) as conn:
+        return _quote(conn, items)
+
+
+def _quote(conn, items):
     lines, total, errors = [], 0.0, []
+    requested = {}
+    if not items:
+        errors.append("订单不能为空")
     for it in items:
         p = _get_product(conn, it["product_id"])
         if not p:
             errors.append(f"没有商品 {it['product_id']}")
             continue
-        qty = int(it["qty"])
-        unit_price = float(it.get("unit_price") or p["price"])
+        try:
+            qty = stock_integer(it.get("qty"), "销售数量", minimum=1)
+            unit_price = float(p["price"] if it.get("unit_price") is None else it["unit_price"])
+            if not math.isfinite(unit_price) or unit_price < 0:
+                raise ValueError("单价必须是大于等于0的有效数字")
+        except (ValueError, TypeError) as exc:
+            errors.append(f"{p['name']}：{exc}")
+            continue
         if unit_price < p["min_price"]:
             errors.append(f"{p['name']} 报价 {unit_price} 元低于店里允许的最低价，不能卖。"
                           f"可以稍微让一点，但不能到这个价。")
             continue
-        if qty > p["stock"]:
-            errors.append(f"{p['name']} 库存只有 {p['stock']}{p['package']}，不够 {qty}。")
+        requested[p["id"]] = requested.get(p["id"], 0) + qty
+        if requested[p["id"]] > p["stock"]:
+            errors.append(f"{p['name']} 库存只有 {p['stock']}{p['package']}，不够合计 {requested[p['id']]}。")
             continue
         sub = round(unit_price * qty, 2)
         total += sub
         lines.append({"product_id": p["id"], "商品": p["name"], "数量": qty,
                       "单价": unit_price, "小计": sub})
-    conn.close()
     return {"ok": not errors, "明细": lines, "合计": round(total, 2), "问题": errors}
 
 
@@ -307,54 +321,53 @@ def _find_usage(conn, pid, crop, purpose):
 def create_order(items: list, customer: str = "", phone: str = ""):
     """items: [{product_id, qty, unit_price(可选), crop, target, mu}]
     农药的 target 是防治对象（必须有登记）；化肥/种子/农具的 target 是用途（底肥、播种等，可不填）。"""
-    q = quote(items)
-    if not q["ok"]:
-        return {"error": "报价校验没有通过，不能开单", "问题": q["问题"]}
-    conn = connect()
-    for it in items:
-        p = _get_product(conn, it["product_id"])
-        if p["category"] != "农药":
-            continue
-        if p["restricted"] == "是" and not (customer and phone):
-            conn.close()
-            return {"error": f"{p['name']} 是限制使用农药，法律要求实名购买，请问客户姓名和电话。"}
-        if not _get_reg(conn, it["product_id"], it.get("crop", ""), it.get("target", "")):
-            conn.close()
-            return {"error": f"{p['name']} 没有登记用于【{it.get('crop')}·{it.get('target')}】，不能开单。"}
+    # 在同一写事务内核价、检查库存、扣货和记账，多个店员同时开单也不会超卖。
+    with closing(connect()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        q = _quote(conn, items)
+        if not q["ok"]:
+            return {"error": "报价校验没有通过，不能开单", "问题": q["问题"]}
+        for it in items:
+            p = _get_product(conn, it["product_id"])
+            if p["category"] != "农药":
+                continue
+            if p["restricted"] == "是" and not (customer and phone):
+                return {"error": f"{p['name']} 是限制使用农药，法律要求实名购买，请问客户姓名和电话。"}
+            if not _get_reg(conn, it["product_id"], it.get("crop", ""), it.get("target", "")):
+                return {"error": f"{p['name']} 没有登记用于【{it.get('crop')}·{it.get('target')}】，不能开单。"}
 
-    guide = _build_guide(conn, items, customer, q["合计"])
-    for it in items:
-        conn.execute("UPDATE products SET stock = stock - ? WHERE id=?",
-                     (int(it["qty"]), it["product_id"]))
-    cur = conn.execute(
-        "INSERT INTO orders(created_at, customer, phone, items_json, total, guide, status) "
-        "VALUES (?,?,?,?,?,?,'正常')",
-        (now(), customer, phone, to_json(items), q["合计"], guide),
-    )
-    order_id = cur.lastrowid
-    # 销售台账明细：把商品信息和当时的进价存成快照
-    prices = {line["product_id"]: line["单价"] for line in q["明细"]}
-    for it in items:
-        p = _get_product(conn, it["product_id"])
-        if p["category"] == "农药":
-            reg = _get_reg(conn, p["id"], it.get("crop", ""), it.get("target", ""))
-            crop, target = reg["crop"], reg["target"]
-        else:
-            crop, target = norm_crop(it.get("crop", "")), (it.get("target") or "").strip()
-        qty = int(it["qty"])
-        price = prices[p["id"]]
-        conn.execute(
-            "INSERT INTO order_items VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (order_id, p["id"], p["name"], p["reg_no"], spec_text(p), p["manufacturer"],
-             qty, price, round(price * qty, 2), crop, target,
-             it.get("mu"), latest_cost(conn, p["id"])))
-    conn.commit()
-    conn.close()
+        guide = _build_guide(conn, items, customer, q["合计"])
+        cur = conn.execute(
+            "INSERT INTO orders(created_at, customer, phone, items_json, total, guide, status) "
+            "VALUES (?,?,?,?,?,?,'正常')",
+            (now(), customer, phone, to_json(items), q["合计"], guide),
+        )
+        order_id = cur.lastrowid
+        # 按行保存价格，允许同一商品的不同订单行采用不同成交价。
+        for it, line in zip(items, q["明细"]):
+            p = _get_product(conn, it["product_id"])
+            if p["category"] == "农药":
+                reg = _get_reg(conn, p["id"], it.get("crop", ""), it.get("target", ""))
+                crop, target = reg["crop"], reg["target"]
+            else:
+                crop, target = norm_crop(it.get("crop", "")), (it.get("target") or "").strip()
+            qty, price = line["数量"], line["单价"]
+            change_stock(conn, p["id"], -qty, "销售出库", order_id)
+            conn.execute(
+                "INSERT INTO order_items VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (order_id, p["id"], p["name"], p["reg_no"], spec_text(p), p["manufacturer"],
+                 qty, price, line["小计"], crop, target,
+                 it.get("mu"), latest_cost(conn, p["id"])))
 
-    ORDERS_DIR.mkdir(exist_ok=True)
-    path = ORDERS_DIR / f"订单{order_id}_使用说明.txt"
-    path.write_text(guide, encoding="utf-8")
-    return {"ok": True, "订单号": order_id, "合计": q["合计"], "用药说明文件": str(path)}
+    result = {"ok": True, "订单号": order_id, "合计": q["合计"]}
+    try:
+        ORDERS_DIR.mkdir(exist_ok=True)
+        path = ORDERS_DIR / f"订单{order_id}_使用说明.txt"
+        path.write_text(guide, encoding="utf-8")
+        result["用药说明文件"] = str(path)
+    except OSError:
+        result["提示"] = "订单已成功保存，请勿重复开单；说明文件写入失败，可从老板后台查看使用说明。"
+    return result
 
 
 def _build_guide(conn, items, customer, total):

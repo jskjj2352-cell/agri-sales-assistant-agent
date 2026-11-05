@@ -7,8 +7,10 @@
 """
 import csv
 import json
+import math
 import sqlite3
-from datetime import datetime
+from contextlib import closing
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 BASE = Path(__file__).parent
@@ -95,8 +97,33 @@ def init_db(reload_catalog: bool = False):
     _add_column(conn, "products", "manufacturer", "TEXT DEFAULT ''")
     _add_column(conn, "products", "reg_no", "TEXT DEFAULT ''")
     _add_column(conn, "products", "category", "TEXT DEFAULT '农药'")
+    _add_column(conn, "products", "stock_warning", "INTEGER NOT NULL DEFAULT 10")
+    _add_column(conn, "products", "stock_target", "INTEGER NOT NULL DEFAULT 30")
     _add_column(conn, "orders", "status", "TEXT DEFAULT '正常'")
     conn.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS stock_movements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL,
+            product_id TEXT NOT NULL, name TEXT NOT NULL, package TEXT,
+            kind TEXT NOT NULL, qty INTEGER NOT NULL, balance INTEGER NOT NULL,
+            ref_id TEXT DEFAULT '', note TEXT DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_movements_date ON stock_movements(created_at);
+        CREATE INDEX IF NOT EXISTS idx_movements_product ON stock_movements(product_id, id);
+        CREATE TRIGGER IF NOT EXISTS product_opening_stock AFTER INSERT ON products
+        BEGIN
+            INSERT INTO stock_movements(created_at, product_id, name, package, kind, qty, balance, note)
+            VALUES (datetime('now', 'localtime'), NEW.id, NEW.name, NEW.package,
+                    '期初库存', NEW.stock, NEW.stock, '商品建档库存');
+        END;
+    """)
+    conn.execute("BEGIN IMMEDIATE")
+    # 旧库存作为升级时的期初余额，不伪造历史流水，也不重复记账。
+    conn.execute("""INSERT INTO stock_movements
+        (created_at, product_id, name, package, kind, qty, balance, note)
+        SELECT ?, p.id, p.name, p.package, '期初库存', p.stock, p.stock, '升级时的库存余额'
+        FROM products p WHERE NOT EXISTS
+        (SELECT 1 FROM stock_movements m WHERE m.product_id=p.id)""", (now(),))
     _backfill_order_items(conn)
 
     # CSV 文件改过（Excel 编辑或后台保存）就自动重新导入，不用手动 --reload
@@ -178,36 +205,128 @@ def latest_cost(conn, product_id):
 
 def add_purchase(product_id, qty, unit_cost, supplier="", batch_no="", prod_date="", note=""):
     """进货入库：记采购台账 + 加库存。"""
-    if qty <= 0:
-        raise ValueError("进货数量必须大于0")
-    conn = connect()
-    p = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
-    if not p:
-        conn.close()
-        raise ValueError(f"没有商品 {product_id}")
-    conn.execute(
-        "INSERT INTO purchases(created_at, product_id, name, reg_no, spec, manufacturer, qty, "
-        "unit_cost, supplier, batch_no, prod_date, note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (now(), p["id"], p["name"], p["reg_no"], spec_text(p), p["manufacturer"], int(qty),
-         float(unit_cost), supplier, batch_no, prod_date, note))
-    conn.execute("UPDATE products SET stock = stock + ? WHERE id=?", (int(qty), product_id))
-    conn.commit()
-    conn.close()
+    qty = stock_integer(qty, "进货数量", minimum=1)
+    unit_cost = float(unit_cost)
+    if not math.isfinite(unit_cost) or unit_cost < 0:
+        raise ValueError("进价必须是大于等于0的有效数字")
+    with closing(connect()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        p = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+        if not p:
+            raise ValueError(f"没有商品 {product_id}")
+        cur = conn.execute(
+            "INSERT INTO purchases(created_at, product_id, name, reg_no, spec, manufacturer, qty, "
+            "unit_cost, supplier, batch_no, prod_date, note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (now(), p["id"], p["name"], p["reg_no"], spec_text(p), p["manufacturer"], qty,
+             unit_cost, supplier, batch_no, prod_date, note))
+        purchase_id = cur.lastrowid
+        change_stock(conn, product_id, qty, "采购入库", purchase_id, note)
+        return purchase_id
 
 
 def void_order(order_id):
     """作废订单：库存加回去，台账里保留记录但标记作废。"""
-    conn = connect()
-    o = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
-    if not o or o["status"] == "作废":
-        conn.close()
-        return False
-    for it in conn.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (order_id,)):
-        conn.execute("UPDATE products SET stock = stock + ? WHERE id=?", (it["qty"], it["product_id"]))
-    conn.execute("UPDATE orders SET status='作废' WHERE id=?", (order_id,))
-    conn.commit()
-    conn.close()
-    return True
+    with closing(connect()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        o = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+        if not o or o["status"] == "作废":
+            return False
+        for it in conn.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (order_id,)):
+            change_stock(conn, it["product_id"], it["qty"], "作废退回", order_id)
+        conn.execute("UPDATE orders SET status='作废' WHERE id=?", (order_id,))
+        return True
+
+
+def stock_integer(value, label="数量", minimum=0):
+    try:
+        number = float(value)
+        if isinstance(value, bool) or not math.isfinite(number) or not number.is_integer():
+            raise ValueError
+        if number < minimum:
+            raise ValueError
+        return int(number)
+    except (ValueError, TypeError, OverflowError):
+        raise ValueError(f"{label}必须是大于等于{minimum}的整数") from None
+
+
+def change_stock(conn, product_id, delta, kind, ref_id="", note=""):
+    """调用方须持有写事务：库存与流水一起提交或回滚。"""
+    delta = stock_integer(abs(delta), minimum=0) * (-1 if delta < 0 else 1)
+    p = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+    if not p:
+        raise ValueError(f"没有商品 {product_id}")
+    balance = p["stock"] + delta
+    if balance < 0:
+        raise ValueError(f"{p['name']} 库存不足，现有 {p['stock']}{p['package']}")
+    conn.execute("UPDATE products SET stock=? WHERE id=?", (balance, product_id))
+    conn.execute("""INSERT INTO stock_movements
+        (created_at, product_id, name, package, kind, qty, balance, ref_id, note)
+        VALUES (?,?,?,?,?,?,?,?,?)""",
+        (now(), product_id, p["name"], p["package"], kind, delta, balance, str(ref_id), note))
+    return balance
+
+
+def adjust_stock(product_id, actual_stock, reason, expected_stock):
+    """盘点时校验页面上的原库存，避免覆盖盘点期间的新销售或入库。"""
+    actual_stock = stock_integer(actual_stock, "实盘库存")
+    if not str(reason).strip():
+        raise ValueError("请填写盘点或报损原因")
+    with closing(connect()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        p = conn.execute("SELECT stock FROM products WHERE id=?", (product_id,)).fetchone()
+        if not p:
+            raise ValueError(f"没有商品 {product_id}")
+        if p[0] != expected_stock:
+            raise ValueError("库存已变化，请刷新页面并重新核对后再盘点")
+        delta = actual_stock - p[0]
+        if delta:
+            change_stock(conn, product_id, delta, "盘点调增" if delta > 0 else "盘点调减",
+                         note=str(reason).strip())
+        return delta
+
+
+def save_stock_settings(rows):
+    with closing(connect()) as conn, conn:
+        for row in rows:
+            warning = stock_integer(row["stock_warning"], "预警线")
+            target = stock_integer(row["stock_target"], "补货目标")
+            if target < warning:
+                raise ValueError("补货目标不能低于预警线")
+            if conn.execute("UPDATE products SET stock_warning=?, stock_target=? WHERE id=?",
+                            (warning, target, row["id"])).rowcount != 1:
+                raise ValueError(f"没有商品 {row['id']}")
+
+
+def inventory_alerts(conn):
+    return conn.execute("""SELECT id, name, category, package, stock, stock_warning, stock_target,
+        CASE WHEN stock <= 0 THEN '缺货' ELSE '库存偏低' END AS alert,
+        MAX(stock_target-stock, 0) AS suggested_qty FROM products
+        WHERE stock <= stock_warning ORDER BY stock <= 0 DESC, stock-stock_warning, id""").fetchall()
+
+
+def inventory_report(conn, start, end):
+    """日期含首尾；采购和有效销售分别汇总后关联，避免明细多对多重复计数。"""
+    start, end = date.fromisoformat(str(start)), date.fromisoformat(str(end))
+    if start > end:
+        raise ValueError("开始日期不能晚于结束日期")
+    bounds = (start.isoformat(), (end + timedelta(days=1)).isoformat())
+    return conn.execute("""
+        WITH buys AS (
+            SELECT product_id, SUM(qty) bought, SUM(qty*unit_cost) purchase_amount
+            FROM purchases WHERE created_at >= ? AND created_at < ? GROUP BY product_id
+        ), sales AS (
+            SELECT oi.product_id, SUM(oi.qty) sold, SUM(oi.amount) sales_amount,
+                SUM(CASE WHEN oi.unit_cost IS NOT NULL THEN oi.amount-oi.qty*oi.unit_cost ELSE 0 END) profit,
+                SUM(CASE WHEN oi.unit_cost IS NULL THEN oi.qty ELSE 0 END) unknown_cost_qty
+            FROM order_items oi JOIN orders o ON o.id=oi.order_id
+            WHERE o.status != '作废' AND o.created_at >= ? AND o.created_at < ? GROUP BY oi.product_id
+        ) SELECT p.id, p.name, p.category, p.package, p.stock,
+            COALESCE(b.bought,0) bought, ROUND(COALESCE(b.purchase_amount,0),2) purchase_amount,
+            COALESCE(s.sold,0) sold, ROUND(COALESCE(s.sales_amount,0),2) sales_amount,
+            ROUND(COALESCE(s.profit,0),2) profit, COALESCE(s.unknown_cost_qty,0) unknown_cost_qty
+        FROM products p LEFT JOIN buys b ON b.product_id=p.id LEFT JOIN sales s ON s.product_id=p.id
+        ORDER BY sales_amount DESC, p.id
+        """, bounds + bounds).fetchall()
 
 
 def export_catalog_csv():
