@@ -15,7 +15,7 @@ import agent
 import vision
 from store import connect, init_db
 
-st.set_page_config(page_title="农资销售助理", page_icon="🌱", layout="centered")
+st.set_page_config(page_title="农资销售助理agent", page_icon="🌱", layout="centered")
 
 TOOL_LABELS = {
     "match_products": "🔍 匹配店里的药",
@@ -175,7 +175,7 @@ with st.sidebar:
     st.caption(f"看图模型：{vision.MODEL}" if vclient else "看图：未开启（缺 qwen_key.txt）")
 
 # ---------------- 主界面 ----------------
-st.title("🌱 农资销售助理")
+st.title("🌱 农资销售助理agent")
 
 if not ss.display:
     # 第一步：点选，不用打字
