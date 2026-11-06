@@ -2,6 +2,14 @@
 
 让不懂农资的店员也能安全卖药：问症状 → 诊断 → 查对症且已登记的药 → 算用量 → 报价 → 开单并打印用药说明。
 
+## 两分钟功能演示
+
+[![农资销售助理agent 功能演示](docs/demo/cover.png)](https://github.com/jskjj2352-cell/agri-sales-assistant-agent/blob/main/docs/demo/agri-sales-assistant-demo.mp4)
+
+[点击观看两分钟中文配音演示](https://github.com/jskjj2352-cell/agri-sales-assistant-agent/blob/main/docs/demo/agri-sales-assistant-demo.mp4) · [下载视频](https://github.com/jskjj2352-cell/agri-sales-assistant-agent/raw/refs/heads/main/docs/demo/agri-sales-assistant-demo.mp4)
+
+前一分钟展示 Agent 的专业知识辅助、商品匹配、用量计算与混配核查；后一分钟展示老板后台的库存预警、进货、出入库流水与经营统计。视频使用演示数据。
+
 ## 快速开始（最简单）
 
 1. 到 https://platform.deepseek.com 注册、充值，创建 API Key
